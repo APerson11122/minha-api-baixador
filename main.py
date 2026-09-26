@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import subprocess
+import urllib.request
+import urllib.parse
 import json
+import re
 
 app = FastAPI()
 
-# Permite que a tua extensão do Chrome fale com a API sem erros de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -21,47 +22,67 @@ class RequestData(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "API Online", "msg": "Baixador Ultra HD funcionando!"}
+    return {"status": "API Online"}
+
+def extrair_id_youtube(url):
+    padrao = r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})'
+    resultado = re.search(padrao, url)
+    return resultado.group(1) if resultado else None
 
 @app.post("/api/get-download-link")
 def get_download_link(data: RequestData):
     url = data.url
     formato_selecionado = data.format
-
-    # Configurar os formatos do yt-dlp
-    # NOTA: O YouTube separa áudio e vídeo em resoluções altas. 
-    # Para sacar direto via link no browser, pedimos a melhor qualidade que já venha com áudio/vídeo juntos (normalmente 720p/1080p).
-    # Se for MP3, extraímos apenas o fluxo de áudio direto.
-    if formato_selecionado.startswith("mp3"):
-        ydl_format = "bestaudio/best"
-    elif "8k" in formato_selecionado:
-        ydl_format = "bestvideo[height<=4320]+bestaudio/best"
-    elif "4k" in formato_selecionado:
-        ydl_format = "bestvideo[height<=2160]+bestaudio/best"
-    else:
-        ydl_format = "best"
+    
+    video_id = extrair_id_youtube(url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Apenas links do YouTube são suportados nesta versão estável.")
 
     try:
-        # Comando para extrair as informações do vídeo em formato JSON, sem descarregar no servidor
-        process = subprocess.Popen(
-            ["yt-dlp", "-j", "-f", ydl_format, url],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = process.communicate()
-
-        if process.returncode != 0:
-            raise Exception(stderr)
-
-        video_info = json.loads(stdout)
+        # Usamos o gateway de API do TomP3/Y2Mate que já resolve o áudio e vídeo juntos em alta qualidade
+        api_url = "https://tomp3.cc"
+        params = urllib.parse.urlencode({'query': url, 'vt': 'home'}).encode('utf-8')
         
-        # Retorna o link direto do servidor da plataforma (Google, TikTok, etc.)
-        return {
-            "status": "success",
-            "download_url": video_info.get("url"),
-            "title": video_info.get("title", "video_extensao")
-        }
+        req = urllib.request.Request(api_url, data=params, headers={'User-Agent': 'Mozilla/5.0'})
+        response = urllib.request.urlopen(req)
+        search_data = json.loads(response.read().decode('utf-8'))
+
+        if search_data.get('status') != 'ok':
+            raise Exception("Não foi possível mapear os formatos do vídeo.")
+
+        is_audio = formato_selecionado.startsWith("mp3") if hasattr(formato_selecionado, 'startsWith') else "mp3" in formato_selecionado
+        key = ""
+
+        if is_audio:
+            mp3_group = search_data['links']['mp3']
+            key = mp3_group[list(mp3_group.keys())[0]]['k']
+        else:
+            mp4_group = search_data['links']['mp4']
+            # Tenta pegar a maior qualidade disponível (8K -> 4K -> 1080p -> 720p)
+            qualidades_alvo = ['4320p', '2160p', '1080p', '720p', '360p']
+            for q in qualidades_alvo:
+                if q in mp4_group:
+                    key = mp4_group[q]['k']
+                    break
+            if not key:
+                key = mp4_group[list(mp4_group.keys())[0]]['k']
+
+        # Converter a chave encontrada no link direto do arquivo final
+        convert_url = "https://tomp3.cc"
+        convert_params = urllib.parse.urlencode({'vid': search_data['vid'], 'k': key}).encode('utf-8')
+        
+        req_convert = urllib.request.Request(convert_url, data=convert_params, headers={'User-Agent': 'Mozilla/5.0'})
+        response_convert = urllib.request.urlopen(req_convert)
+        convert_data = json.loads(response_convert.read().decode('utf-8'))
+
+        if convert_data.get('status') == 'ok' and convert_data.get('dlink'):
+            return {
+                "status": "success",
+                "download_url": convert_data['dlink'],
+                "title": search_data.get('title', 'video_extensao')
+            }
+        else:
+            raise Exception("Falha ao gerar link direto.")
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao processar link: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
