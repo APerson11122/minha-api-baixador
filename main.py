@@ -1,7 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pytube import YouTube
+import urllib.request
+import urllib.parse
+import json
+import re
 
 app = FastAPI()
 
@@ -19,35 +22,77 @@ class RequestData(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "API Online e Pronta"}
+    return {"status": "API Ativa"}
+
+def extrair_id(url):
+    padrao = r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})'
+    resultado = re.search(padrao, url)
+    return resultado.group(1) if resultado else None
 
 @app.post("/api/get-download-link")
 def get_download_link(data: RequestData):
     url = data.url
     formato_selecionado = data.format
+    
+    video_id = extrair_id(url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Por favor, insira um link válido do YouTube.")
 
     try:
-        # Inicializa o motor de extração direta do YouTube
-        yt = YouTube(url)
+        # Consulta direta ao motor estável de decodificação de stream
+        api_url = "https://tomp3.cc"
+        params = urllib.parse.urlencode({'query': url, 'vt': 'home'}).encode('utf-8')
         
+        req = urllib.request.Request(
+            api_url, 
+            data=params, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
+        )
+        response = urllib.request.urlopen(req)
+        search_data = json.loads(response.read().decode('utf-8'))
+
+        if search_data.get('status') != 'ok':
+            raise Exception("Não foi possível mapear as qualidades do vídeo.")
+
         is_audio = "mp3" in formato_selecionado
+        key = ""
 
         if is_audio:
-            # Extrai apenas o fluxo de áudio com a melhor qualidade
-            stream = yt.streams.get_audio_only()
+            mp3_group = search_data['links']['mp3']
+            # Obtém a melhor taxa de bits de áudio disponível
+            melhor_audio = list(mp3_group.keys())[0]
+            key = mp3_group[melhor_audio]['k']
         else:
-            # Tenta encontrar o vídeo com a maior resolução possível que já inclua ÁUDIO e VÍDEO juntos (progressive)
-            # Isto garante que o download funcione diretamente no navegador sem precisar de conversão no servidor
-            stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+            mp4_group = search_data['links']['mp4']
+            # Filtra a resolução configurada pela extensão
+            resolucoes = ['4320p', '2160p', '1080p', '720p', '360p']
+            for res in resolucoes:
+                if res in mp4_group:
+                    key = mp4_group[res]['k']
+                    break
+            if not key:
+                key = mp4_group[list(mp4_group.keys())][0]['k']
 
-        if stream and stream.url:
+        # Converte o token extraído para o endereço direto do arquivo .mp4/.mp3
+        convert_url = "https://tomp3.cc"
+        convert_params = urllib.parse.urlencode({'vid': search_data['vid'], 'k': key}).encode('utf-8')
+        
+        req_convert = urllib.request.Request(
+            convert_url, 
+            data=convert_params, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
+        )
+        response_convert = urllib.request.urlopen(req_convert)
+        convert_data = json.loads(response_convert.read().decode('utf-8'))
+
+        if convert_data.get('status') == 'ok' and convert_data.get('dlink'):
             return {
                 "status": "success",
-                "download_url": stream.url,
-                "title": yt.title
+                "download_url": convert_data['dlink'],
+                "title": search_data.get('title', 'video_download')
             }
         else:
-            raise Exception("Não foi possível gerar um fluxo de download para este vídeo.")
+            raise Exception("O servidor remoto rejeitou a conversão da stream.")
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
